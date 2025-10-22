@@ -2,30 +2,54 @@ FROM node:22.8.0
 
 WORKDIR /app
 
-# Disable Corepack (avoid TUF/signature issues) and install pnpm + wrangler globally
-RUN corepack disable || true && \
-    npm install -g pnpm@9.12.2 wrangler
+ENV \
+  # give Node more heap to avoid OOM aborts (adjust up if needed)
+  NODE_OPTIONS=--max-old-space-size=3072 \
+  # quieter CI env, but we’ll ask tools to be verbose explicitly
+  CI=true \
+  # avoid any package manager telemetry noise
+  NPM_CONFIG_FUND=false PNPM_HOME=/usr/local/share/pnpm \
+  COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
-# Copy only dependency files first for better caching
+# Optional: system toolchain for native deps (node-gyp, sharp, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 make g++ ca-certificates git \
+  && rm -rf /var/lib/apt/lists/*
+
+# Do NOT use corepack (it caused your previous crash)
+RUN corepack disable || true \
+ && npm install -g pnpm@9.12.2 wrangler
+
+# Cache deps
 COPY package.json pnpm-lock.yaml ./
 
-# Install deps strictly per lockfile
-RUN pnpm install --frozen-lockfile
+# Install with full log output to aid debugging if it fails
+RUN pnpm --version && node --version \
+ && pnpm install --frozen-lockfile --reporter=ndjson
 
-# Copy the rest of the project
+# App code
 COPY . .
 
-# Normalize line endings & ensure script is executable
+# Normalize script and ensure executable
 RUN tr -d '\r' < bindings.sh > bindings.tmp \
  && mv bindings.tmp bindings.sh \
  && chmod +x bindings.sh
 
-# Build the app
-RUN pnpm run build
+# Pre-verify tool versions (helpful in logs)
+RUN npx --yes vite --version || true \
+ && pnpm run -w --silent -c "echo 'scripts:' && jq -r '.scripts' package.json || true" || true
+
+# Build with extra verbosity; if it fails, dump useful files
+RUN pnpm run -r -w --stream build || ( \
+      echo '--- BUILD FAILED; dumping context ---' && \
+      node --version && pnpm --version && \
+      test -f vite.config.ts && cat vite.config.ts || true && \
+      test -f vite.config.js && cat vite.config.js || true && \
+      test -f tsconfig.json && cat tsconfig.json || true && \
+      exit 1 \
+    )
 
 EXPOSE 5173
-
-ENV NODE_ENV=production \
-    RUNNING_IN_DOCKER=true
+ENV NODE_ENV=production RUNNING_IN_DOCKER=true
 
 CMD ["pnpm", "run", "dockerstart"]
