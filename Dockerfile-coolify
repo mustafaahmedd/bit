@@ -1,55 +1,58 @@
+# ---- Dockerfile-coolify (production image for Coolify) ----
 FROM node:22.8.0
 
 WORKDIR /app
 
+# Helpful defaults for CI builds and bigger bundles
 ENV \
-  # give Node more heap to avoid OOM aborts (adjust up if needed)
-  NODE_OPTIONS=--max-old-space-size=3072 \
-  # quieter CI env, but we’ll ask tools to be verbose explicitly
+  NODE_OPTIONS=--max-old-space-size=4096 \
   CI=true \
-  # avoid any package manager telemetry noise
-  NPM_CONFIG_FUND=false PNPM_HOME=/usr/local/share/pnpm \
+  PNPM_HOME=/usr/local/share/pnpm \
+  NPM_CONFIG_FUND=false \
   COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
-# Optional: system toolchain for native deps (node-gyp, sharp, etc.)
+# Toolchain for native deps (sharp/canvas/etc.) + jq for debug prints
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 make g++ ca-certificates git \
+      python3 make g++ ca-certificates git jq \
   && rm -rf /var/lib/apt/lists/*
 
-# Do NOT use corepack (it caused your previous crash)
+# Do NOT use Corepack (it caused signature errors); install pnpm explicitly
 RUN corepack disable || true \
- && npm install -g pnpm@9.12.2 wrangler
+ && npm install -g pnpm@9.12.2
 
-# Cache deps
+# Copy only dependency files first for better layer caching
 COPY package.json pnpm-lock.yaml ./
 
-# Install with full log output to aid debugging if it fails
-RUN pnpm --version && node --version \
- && pnpm install --frozen-lockfile --reporter=ndjson
+# Install deps strictly per lockfile; verbose output for CI logs
+# If you hit optional native deps issues, add: --no-optional
+RUN pnpm install --frozen-lockfile --reporter=ndjson
 
-# App code
+# Copy the rest of the project
 COPY . .
 
-# Normalize script and ensure executable
-RUN tr -d '\r' < bindings.sh > bindings.tmp \
- && mv bindings.tmp bindings.sh \
- && chmod +x bindings.sh
+# Normalize line endings for script and ensure it's executable
+RUN if [ -f bindings.sh ]; then \
+      tr -d '\r' < bindings.sh > bindings.tmp && \
+      mv bindings.tmp bindings.sh && chmod +x bindings.sh; \
+    fi
 
-# Pre-verify tool versions (helpful in logs)
-RUN npx --yes vite --version || true \
- && pnpm run -w --silent -c "echo 'scripts:' && jq -r '.scripts' package.json || true" || true
+# Optional: show versions in logs to help debugging
+RUN node --version && pnpm --version
 
-# Build with extra verbosity; if it fails, dump useful files
-RUN pnpm run -r -w --stream build || ( \
-      echo '--- BUILD FAILED; dumping context ---' && \
-      node --version && pnpm --version && \
-      test -f vite.config.ts && cat vite.config.ts || true && \
-      test -f vite.config.js && cat vite.config.js || true && \
-      test -f tsconfig.json && cat tsconfig.json || true && \
-      exit 1 \
-    )
+# Build (capture full log, show last 200 lines on failure, preserve exit code)
+RUN bash -lc 'set -euo pipefail; \
+  pnpm run build 2>&1 | tee /tmp/build.log; \
+  ec=${PIPESTATUS[0]}; \
+  if [ $ec -ne 0 ]; then \
+    echo "---- BUILD FAILED (exit $ec) — last 200 lines ----"; \
+    tail -n 200 /tmp/build.log || true; \
+    echo "-----------------------------------------------"; \
+    exit $ec; \
+  fi'
 
 EXPOSE 5173
-ENV NODE_ENV=production RUNNING_IN_DOCKER=true
+
+ENV NODE_ENV=production \
+    RUNNING_IN_DOCKER=true
 
 CMD ["pnpm", "run", "dockerstart"]
